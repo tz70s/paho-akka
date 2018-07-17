@@ -2,9 +2,13 @@ package com.sandinh.paho.akka
 
 import java.net.{URLDecoder, URLEncoder}
 
-import akka.actor.{FSM, Props, Terminated}
+import akka.actor.{ActorRef, FSM, Props, Terminated}
 import org.eclipse.paho.client.mqttv3._
-import MqttException.{REASON_CODE_CLIENT_NOT_CONNECTED, REASON_CODE_MAX_INFLIGHT}
+import MqttException.{
+  REASON_CODE_CLIENT_NOT_CONNECTED,
+  REASON_CODE_MAX_INFLIGHT
+}
+
 import scala.collection.mutable
 import scala.util.control.NonFatal
 import MqttPubSub._
@@ -61,6 +65,8 @@ class MqttPubSub(cfg: PSConfig) extends FSM[PSState, Unit] {
   private[this] val subscribing = mutable.Set.empty[Subscribe]
   private[this] val unsubscribing = mutable.Set.empty[Unsubscribe]
 
+  private[this] val publishers = mutable.Map.empty[String, ActorRef]
+
   //reconnect attempt count, reset when connect success
   private[this] var connectCount = 0
 
@@ -93,15 +99,16 @@ class MqttPubSub(cfg: PSConfig) extends FSM[PSState, Unit] {
       while (subStash.nonEmpty) self ! subStash.dequeue()
       //remove expired Publish messages
       if (cfg.stashTimeToLive.isFinite())
-        pubStash.dequeueAll(_._1 + cfg.stashTimeToLive.toNanos < System.nanoTime)
+        pubStash.dequeueAll(
+          _._1 + cfg.stashTimeToLive.toNanos < System.nanoTime)
       while (pubStash.nonEmpty) self ! pubStash.dequeue()._2
       goto(ConnectedState)
 
     case Event(x: Publish, _) =>
       if (pubStash.length > cfg.stashCapacity)
-        while (pubStash.length > cfg.stashCapacity / 2)
-          pubStash.dequeue()
+        while (pubStash.length > cfg.stashCapacity / 2) pubStash.dequeue()
       pubStash += (System.nanoTime -> x)
+      publishers(x.topic) = sender()
       stay()
 
     case Event(x: Subscribe, _) =>
@@ -116,19 +123,32 @@ class MqttPubSub(cfg: PSConfig) extends FSM[PSState, Unit] {
   when(ConnectedState) {
     case Event(p: Publish, _) =>
       try {
-        client.publish(p.topic, p.message())
+        client.publish(
+          p.topic,
+          p.message()
+        )
       } catch {
         //underlying client can be disconnected when this FSM is in state SConnected. See ResubscribeSpec
-        case e: MqttException if e.getReasonCode == REASON_CODE_CLIENT_NOT_CONNECTED =>
+        case e: MqttException
+            if e.getReasonCode == REASON_CODE_CLIENT_NOT_CONNECTED =>
           self ! Disconnected //delayConnect & goto SDisconnected
           self ! p //stash p
         case e: MqttException if e.getReasonCode == REASON_CODE_MAX_INFLIGHT =>
-          logger.error(s"can't publish to ${p.topic}. " +
-            MessageCatalog.getMessage(REASON_CODE_MAX_INFLIGHT) +
-            ". Pls use a larger `ConnOptions.maxInflight`")
+          logger.error(
+            s"can't publish to ${p.topic}. " +
+              MessageCatalog.getMessage(REASON_CODE_MAX_INFLIGHT) +
+              ". Pls use a larger `ConnOptions.maxInflight`")
         case NonFatal(e) =>
           logger.error(e)(s"can't publish to ${p.topic}")
       }
+      publishers(p.topic) = sender()
+      stay()
+
+    case Event(d: DeliveryComplete, _) =>
+      logger.info(
+        s"success deliver, propagate back to publisher ${publishers(d.topic)}")
+      publishers(d.topic) ! AckOwnerDeliveryComplete
+      publishers.remove(d.topic)
       stay()
 
     case Event(sub: Subscribe, _) =>
@@ -151,8 +171,10 @@ class MqttPubSub(cfg: PSConfig) extends FSM[PSState, Unit] {
       try {
         client.unsubscribe(urlDec(topicRef.path.name))
       } catch {
-        case e: MqttException if e.getReasonCode == REASON_CODE_CLIENT_NOT_CONNECTED => //do nothing
-        case NonFatal(e) => logger.error(e)(s"can't unsubscribe from ${topicRef.path.name}")
+        case e: MqttException
+            if e.getReasonCode == REASON_CODE_CLIENT_NOT_CONNECTED => //do nothing
+        case NonFatal(e) =>
+          logger.error(e)(s"can't unsubscribe from ${topicRef.path.name}")
       }
       stay()
   }
@@ -205,7 +227,8 @@ class MqttPubSub(cfg: PSConfig) extends FSM[PSState, Unit] {
       try {
         client.subscribe(sub.topic, sub.qos, null, subsListener)
       } catch {
-        case e: MqttException if e.getReasonCode == REASON_CODE_CLIENT_NOT_CONNECTED =>
+        case e: MqttException
+            if e.getReasonCode == REASON_CODE_CLIENT_NOT_CONNECTED =>
           self ! Disconnected //delayConnect & goto SDisconnected
           self ! sub //stash Subscribe
         case NonFatal(e) =>

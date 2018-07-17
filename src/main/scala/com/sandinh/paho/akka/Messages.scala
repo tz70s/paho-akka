@@ -16,6 +16,9 @@ case class UnsubscribeAck(topic: String)
 
 class Message(val topic: String, val payload: Array[Byte])
 
+case object AckOwnerDeliveryComplete
+case class DeliveryComplete(topic: String)
+
 /** This class wrap params for publishing to mqtt.
   *
   * Send an instance of this class to the MqttPubSub actor for publishing:
@@ -30,5 +33,6 @@ class Publish(val topic: String, payload: Array[Byte], qos: Int) {
 }
 
 object Publish {
-  @inline def apply(topic: String, payload: Array[Byte], qos: Int = 0) = new Publish(topic, payload, qos)
+  @inline def apply(topic: String, payload: Array[Byte], qos: Int = 2) =
+    new Publish(topic, payload, qos)
 }
